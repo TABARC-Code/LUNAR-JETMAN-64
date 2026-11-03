@@ -1,0 +1,1307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+
+<title>Lunar Jetman 64 | ZX Spectrum-Inspired Web Game | TABARC-Studio</title>
+
+<meta name="description" content="Play Lunar Jetman 64 by TABARC-Studio, an early attempt at a browser game inspired by a classic ZX Spectrum game. Keyboard controls only for now.">
+<meta name="author" content="Lunar Jetman 64">
+<meta name="application-name" content="Lunar Jetman 64">
+<meta name="apple-mobile-web-app-title" content="Lunar Jetman 64">
+<meta name="theme-color" content="#000000">
+
+<meta property="og:type" content="website">
+<meta property="og:locale" content="en_GB">
+<meta property="og:site_name" content="TABARC-Studio">
+<meta property="og:title" content="Lunar Jetman 64 | TABARC-Studio">
+<meta property="og:description" content="An early attempt at a browser game inspired by a ZX Spectrum classic. Play Lunar Jetman 64 with the keyboard.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Lunar Jetman 64 | TABARC-Studio">
+<meta name="twitter:description" content="An early attempt at a browser game inspired by a ZX Spectrum classic. Keyboard controls only.">
+
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+  }
+  #c {
+    display: block;
+    image-rendering: pixelated;
+    border: 1px solid #1a3a2a;
+    box-shadow: 0 0 60px rgba(0,255,120,0.15), 0 0 120px rgba(0,100,80,0.08);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// --- CANVAS SETUP ---
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 820, H = 520;
+canvas.width = W; canvas.height = H;
+
+// --- CONSTANTS ---
+const WORLD_W   = 8000;
+const GRAVITY   = 0.28;
+const JET_THRUST= 0.55;
+const WALK_SPD  = 3.2;
+const ROVER_SPD = 4.8;
+const BSPD      = 9;
+
+// --- AUDIO ENGINE ---
+let audioCtx = null;
+function ensureAudio() {
+  if (audioCtx) return;
+  try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; }
+}
+function synth(freq, dur, type='square', vol=0.08, freqEnd=null) {
+  try {
+    ensureAudio();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.type = type; osc.frequency.value = freq;
+    if (freqEnd) osc.frequency.linearRampToValueAtTime(freqEnd, audioCtx.currentTime + dur);
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.start(); osc.stop(audioCtx.currentTime + dur);
+  } catch(e){}
+}
+function sndShoot()    { synth(900, 0.07, 'square', 0.06, 400); }
+function sndJet()      { synth(120 + Math.random()*40, 0.08, 'sawtooth', 0.025); }
+function sndExplode()  { synth(90, 0.35, 'sawtooth', 0.18, 30); setTimeout(() => synth(50,0.25,'sawtooth',0.12,20), 60); }
+function sndHit()      { synth(600, 0.08, 'square', 0.07, 200); }
+function sndDie()      { synth(300, 0.5, 'sawtooth', 0.15, 30); }
+function sndBoard()    { synth(400, 0.12, 'triangle', 0.1, 600); }
+function sndLevelUp()  { [440,550,660,880].forEach((f,i) => setTimeout(() => synth(f,0.15,'triangle',0.12), i*100)); }
+
+// --- TERRAIN ---
+let terrain; // Uint16Array - y position for each world x
+
+function buildTerrain() {
+  terrain = new Uint16Array(WORLD_W + 2);
+  const BASE_H = H - 95;
+  for (let x = 0; x < WORLD_W; x++) {
+    let h = BASE_H;
+    h += Math.sin(x * 0.0025) * 22;
+    h += Math.sin(x * 0.0071 + 1.3) * 14;
+    h += Math.sin(x * 0.018 + 2.7) * 7;
+    h += Math.sin(x * 0.045 + 0.5) * 3;
+    terrain[x] = Math.round(h);
+  }
+  // Craters
+  const craters = 14;
+  for (let c = 0; c < craters; c++) {
+    const cx = 600 + Math.random() * (WORLD_W - 1200);
+    const cr = 40 + Math.random() * 70;
+    for (let x = cx - cr; x < cx + cr; x++) {
+      const xi = Math.floor(x);
+      if (xi < 0 || xi >= WORLD_W) continue;
+      const d = Math.abs(x - cx) / cr;
+      terrain[xi] += Math.round((1 - d * d * 0.5) * 18);
+    }
+  }
+  // Flatten base area
+  const bx = Math.floor(WORLD_W / 2);
+  const bh = terrain[bx];
+  for (let x = bx - 180; x < bx + 180; x++) if (x >= 0 && x < WORLD_W) terrain[x] = bh;
+  // Flatten start area
+  const sh = terrain[460];
+  for (let x = 400; x < 600; x++) if (x < WORLD_W) terrain[x] = sh;
+}
+
+function terrainAt(x) {
+  const xi = Math.floor(x);
+  if (xi < 0) return H - 95;
+  if (xi >= WORLD_W) return H - 95;
+  return terrain[xi];
+}
+
+// --- STARS ---
+let stars = [];
+function buildStars() {
+  stars = [];
+  for (let i = 0; i < 280; i++) {
+    stars.push({
+      x: Math.random() * WORLD_W,
+      y: 10 + Math.random() * (H * 0.62),
+      r: Math.random() * 1.6 + 0.3,
+      b: Math.random() * 0.65 + 0.35,
+      speed: 0.05 + Math.random() * 0.45,
+      twinkle: Math.random() * Math.PI * 2
+    });
+  }
+}
+
+// --- GAME STATE ---
+let state  = 'title'; // 'title' | 'playing' | 'dead' | 'gameover'
+let score  = 0;
+let lives  = 3;
+let level  = 1;
+let frame  = 0;
+let shake  = 0;
+let camX   = 0;
+let deathTimer = 0;
+
+// --- ENTITIES ---
+let jm, rover, base;
+let enemies=[], bullets=[], ebullets=[], bombs=[], particles=[];
+let waveTimer = 0;
+let pendingSpawns = 0;
+let waveGen = 0;
+
+function resetEntities() {
+  const sh = terrainAt(480);
+  jm = {
+    x: 450, y: sh - 22, vx: 0, vy: 0,
+    w: 14, h: 22,
+    facing: 1,
+    onGround: false,
+    jetting: false,
+    fuel: 100, maxFuel: 100,
+    inRover: false,
+    invincible: 0,
+    alive: true,
+    shootTimer: 0,
+    jetTimer: 0
+  };
+  rover = {
+    x: 530, y: 0, vx: 0,
+    w: 52, h: 26,
+    facing: 1,
+    onGround: true,
+    hasJetman: false,
+    hp: 6, maxHp: 6,
+    alive: true
+  };
+  rover.y = terrainAt(rover.x + rover.w/2) - rover.h;
+
+  const bx = WORLD_W/2 - 65;
+  const by = terrainAt(bx + 65) - 64;
+  base = { x: bx, y: by, w: 130, h: 64, hp: 10, maxHp: 10 };
+
+  enemies=[]; bullets=[]; ebullets=[]; bombs=[]; particles=[];
+  camX = jm.x - W/2;
+  waveTimer = 0;
+  waveGen++;
+  pendingSpawns = 0;
+  spawnWave();
+}
+
+function startGame() {
+  score = 0; lives = 3; level = 1;
+  state = 'playing';
+  resetEntities();
+}
+
+// --- ENEMY TYPES ---
+// 0=Scout, 1=Bomber, 2=Fighter, 3=Mothership
+const EDEFS = [
+  { name:'SCOUT',    w:26,h:13, hp:1, spd:2.8, pts:100, col:'#ff3333', col2:'#ff8888' },
+  { name:'BOMBER',   w:34,h:16, hp:2, spd:1.3, pts:200, col:'#ff7700', col2:'#ffaa44' },
+  { name:'FIGHTER',  w:24,h:16, hp:3, spd:2.2, pts:350, col:'#cc00ff', col2:'#ee66ff' },
+  { name:'MOTHERSHIP',w:58,h:26,hp:12,spd:0.7, pts:1200,col:'#0099ff', col2:'#55ccff' },
+];
+
+function spawnEnemy(type, ox, oy) {
+  const d = EDEFS[type];
+  const side = Math.random() < 0.5 ? -1 : 1;
+  enemies.push({
+    type, x: ox ?? (side < 0 ? camX - 80 : camX + W + 80),
+    y: oy ?? (40 + Math.random() * 160),
+    vx: 0, vy: 0,
+    w: d.w, h: d.h,
+    hp: d.hp, maxHp: d.hp,
+    timer: Math.random() * 300 | 0,
+    pattern: Math.random() * 3 | 0,
+    shootCd: (60 + Math.random() * 100) | 0,
+    bombCd:  (100 + Math.random() * 200) | 0,
+    alive: true
+  });
+}
+
+function spawnWave() {
+  const n = 3 + level * 2;
+  for (let i = 0; i < n; i++) {
+    const t = Math.min((Math.random() * (1 + level * 0.6)) | 0, 3);
+    const gen = waveGen;
+    pendingSpawns++;
+    setTimeout(() => {
+      if (gen !== waveGen) return;
+      pendingSpawns = Math.max(0, pendingSpawns - 1);
+      spawnEnemy(t);
+    }, i * 700 + Math.random()*300);
+  }
+}
+
+// --- PARTICLES ---
+function explode(x, y, col, n=22, spd=4) {
+  shake = Math.max(shake, 9);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 1 + Math.random() * spd;
+    particles.push({
+      x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+      life: 30 + Math.random()*35, maxLife: 65,
+      col, size: 2 + Math.random() * 4
+    });
+  }
+}
+function puff(x, y) {
+  for (let i = 0; i < 5; i++) {
+    particles.push({
+      x: x + (Math.random()-0.5)*10, y,
+      vx: (Math.random()-0.5)*1.8, vy: -Math.random()*2.5,
+      life: 14 + Math.random()*12, maxLife: 26,
+      col: '#99aabb', size: 2
+    });
+  }
+}
+
+// --- INPUT ---
+const keys = {};
+window.addEventListener('keydown', e => {
+  if (!keys[e.code]) {
+    keys[e.code] = true;
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+    if (state==='title' && (e.code==='Space'||e.code==='Enter')) { ensureAudio(); startGame(); }
+    if (state==='gameover' && (e.code==='KeyR'||e.code==='Enter')) { ensureAudio(); startGame(); }
+    if (state==='playing') {
+      // Board / Exit rover
+      if (e.code === 'KeyE' || e.code === 'Enter') {
+        if (!jm.inRover) {
+          const dx = (jm.x+jm.w/2) - (rover.x+rover.w/2);
+          const dy = (jm.y+jm.h)   - (rover.y+rover.h/2);
+          if (Math.abs(dx) < rover.w*0.6 && Math.abs(dy) < rover.h && jm.onGround) {
+            jm.inRover = true; rover.hasJetman = true; sndBoard();
+          }
+        } else {
+          exitRover();
+        }
+      }
+    }
+    if (e.code === 'KeyP') {
+      if (state === 'playing') state = 'paused';
+      else if (state === 'paused') state = 'playing';
+    }
+  }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function exitRover() {
+  jm.inRover = false; rover.hasJetman = false;
+  jm.x = rover.x + rover.w/2 - jm.w/2;
+  jm.y = rover.y - jm.h - 3;
+  jm.vy = -2; jm.vx = rover.vx;
+  sndBoard();
+}
+
+// --- UPDATE ---
+function updateJetman() {
+  if (jm.inRover || !jm.alive) return;
+  if (jm.invincible > 0) jm.invincible--;
+
+  jm.vx = 0;
+  if (keys['ArrowLeft']  || keys['KeyA']) { jm.vx = -WALK_SPD; jm.facing = -1; }
+  if (keys['ArrowRight'] || keys['KeyD']) { jm.vx =  WALK_SPD; jm.facing =  1; }
+
+  // Jetpack
+  const jetKey = keys['ArrowUp'] || keys['KeyW'] || keys['Space'];
+  jm.jetting = false;
+  if (jetKey && jm.fuel > 0) {
+    jm.vy -= JET_THRUST;
+    jm.fuel = Math.max(0, jm.fuel - 0.55);
+    jm.jetting = true;
+    jm.jetTimer++;
+    if (jm.jetTimer % 3 === 0) { sndJet(); puff(jm.x+jm.w/2, jm.y+jm.h); }
+  } else {
+    jm.jetTimer = 0;
+  }
+
+  jm.vy += GRAVITY;
+  jm.vy  = Math.max(-12, Math.min(16, jm.vy));
+  jm.x  += jm.vx;
+  jm.y  += jm.vy;
+
+  // Terrain
+  const ty = terrainAt(jm.x + jm.w/2);
+  if (jm.y + jm.h >= ty) {
+    jm.y = ty - jm.h;
+    jm.vy = 0;
+    jm.onGround = true;
+    jm.fuel = Math.min(jm.maxFuel, jm.fuel + 0.35);
+  } else {
+    jm.onGround = false;
+  }
+
+  jm.x = Math.max(0, Math.min(WORLD_W - jm.w, jm.x));
+  if (jm.y < -30) { jm.y = -30; jm.vy = 0; }
+
+  // Shoot
+  if (jm.shootTimer > 0) jm.shootTimer--;
+  if ((keys['KeyZ'] || keys['KeyX']) && jm.shootTimer === 0) {
+    bullets.push({ x: jm.x + (jm.facing>0 ? jm.w+2 : -14), y: jm.y+jm.h*0.4,
+      vx: BSPD * jm.facing, vy: 0, w:12, h:4, owner:'jm' });
+    jm.shootTimer = 11;
+    sndShoot();
+  }
+
+  // Fall off world = die
+  if (jm.y > H + 80) killJetman();
+}
+
+function updateRover() {
+  if (!rover.alive) return;
+  if (rover.hasJetman) {
+    rover.vx = 0;
+    if (keys['ArrowLeft']  || keys['KeyA']) { rover.vx = -ROVER_SPD; rover.facing = -1; }
+    if (keys['ArrowRight'] || keys['KeyD']) { rover.vx =  ROVER_SPD; rover.facing =  1; }
+
+    if (jm.shootTimer > 0) jm.shootTimer--;
+    if ((keys['KeyZ'] || keys['KeyX']) && jm.shootTimer === 0) {
+      bullets.push({ x: rover.x + (rover.facing>0 ? rover.w+2 : -14), y: rover.y + 6,
+        vx: BSPD * rover.facing * 1.15, vy: 0, w:14, h:5, owner:'rover' });
+      jm.shootTimer = 9;
+      sndShoot();
+    }
+  } else {
+    rover.vx *= 0.85;
+  }
+
+  rover.x += rover.vx;
+  rover.x  = Math.max(0, Math.min(WORLD_W - rover.w, rover.x));
+  rover.y  = terrainAt(rover.x + rover.w/2) - rover.h;
+
+  // Sync jetman position in rover
+  if (jm.inRover) {
+    jm.x = rover.x + rover.w/2 - jm.w/2;
+    jm.y = rover.y - 4;
+    jm.facing = rover.facing;
+    jm.onGround = true;
+  }
+}
+
+function updateEnemies() {
+  const jcx = jm.x + jm.w/2, jcy = jm.y + jm.h/2;
+  const bcx = base.x + base.w/2;
+
+  for (let i = enemies.length-1; i >= 0; i--) {
+    const e = enemies[i];
+    if (!e.alive) { enemies.splice(i,1); continue; }
+    e.timer++;
+    const d = EDEFS[e.type];
+
+    // Target: Bombers go for base, others chase jetman
+    const tx = e.type===1 ? bcx : jcx;
+    const dx = tx - (e.x + e.w/2);
+
+    // Movement patterns
+    switch(e.pattern % 3) {
+      case 0: // Approach + drift
+        e.vx += (dx>0?1:-1)*0.09;
+        e.vx  = Math.max(-d.spd, Math.min(d.spd, e.vx));
+        e.vy  = Math.sin(e.timer*0.035)*2;
+        break;
+      case 1: // Sine swoop
+        e.vx += (dx>0?1:-1)*0.06;
+        e.vx  = Math.max(-d.spd, Math.min(d.spd, e.vx));
+        const tgt = 70 + Math.sin(e.timer*0.025)*80;
+        e.vy += (tgt - e.y)*0.025;
+        e.vy  = Math.max(-3,Math.min(3,e.vy));
+        break;
+      case 2: // Figure-8 orbit
+        e.x  += Math.sin(e.timer*0.022)*d.spd;
+        e.y   = 55 + Math.sin(e.timer*0.04)*90 + Math.cos(e.timer*0.022)*35;
+        break;
+    }
+    if (e.pattern < 2) { e.x += e.vx; e.y += e.vy; }
+    e.y = Math.max(18, Math.min(H*0.52, e.y));
+
+    // Bombers drop bombs near base
+    if (e.type===1) {
+      e.bombCd--;
+      if (e.bombCd <= 0) {
+        e.bombCd = (130 + Math.random()*200)|0;
+        if (Math.abs(e.x - bcx) < 220) {
+          bombs.push({ x:e.x+e.w/2, y:e.y+e.h, vy:1.8+Math.random() });
+        }
+      }
+    }
+
+    // Fighters + Motherships shoot at jetman
+    if (e.type >= 2) {
+      e.shootCd--;
+      if (e.shootCd <= 0) {
+        e.shootCd = (55 + Math.random()*80)|0;
+        const ang = Math.atan2(jcy-e.y, jcx-e.x);
+        const spd = 3.2 + level*0.2;
+        ebullets.push({ x:e.x+e.w/2, y:e.y+e.h/2, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, w:7,h:4 });
+        if (e.type===3) { // Mothership fires spread
+          [-0.3,0.3].forEach(da => {
+            ebullets.push({ x:e.x+e.w/2, y:e.y+e.h/2, vx:Math.cos(ang+da)*spd, vy:Math.sin(ang+da)*spd, w:6,h:3 });
+          });
+        }
+      }
+    }
+
+    // Mothership spawns scouts periodically
+    if (e.type===3 && e.timer%280===0 && enemies.length < 14) {
+      spawnEnemy(0, e.x + e.w/2, e.y + e.h);
+    }
+
+    // Wraparound horizontally (enemies roam world)
+    if (e.x < camX - 200) e.x = camX + W + 50;
+    if (e.x > camX + W + 200) e.x = camX - 50;
+  }
+}
+
+function updateBullets() {
+  for (let i = bullets.length-1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx; b.y += b.vy;
+    if (b.y >= terrainAt(b.x) || b.x < 0 || b.x > WORLD_W || b.y < -10) { bullets.splice(i,1); continue; }
+    let removed = false;
+    for (let j = enemies.length-1; j >= 0; j--) {
+      const e = enemies[j];
+      if (b.x+b.w>e.x && b.x<e.x+e.w && b.y+b.h>e.y && b.y<e.y+e.h) {
+        e.hp--;
+        sndHit();
+        explode(b.x, b.y, '#ffff88', 5, 2);
+        if (e.hp <= 0) {
+          explode(e.x+e.w/2, e.y+e.h/2, EDEFS[e.type].col, 28, 5);
+          sndExplode();
+          score += EDEFS[e.type].pts * level;
+          e.alive = false;
+        }
+        bullets.splice(i,1); removed=true; break;
+      }
+    }
+    if (!removed && (b.x < camX-40 || b.x > camX+W+40)) bullets.splice(i,1);
+  }
+
+  // Enemy bullets
+  for (let i = ebullets.length-1; i >= 0; i--) {
+    const b = ebullets[i];
+    b.x += b.vx; b.y += b.vy;
+    if (b.y >= terrainAt(b.x) || b.x < 0 || b.x > WORLD_W || b.y < -20 || b.y > H+20) { ebullets.splice(i,1); continue; }
+    // Hit jetman
+    if (jm.alive && jm.invincible===0) {
+      const hx = jm.inRover ? rover.x : jm.x, hy = jm.inRover ? rover.y : jm.y;
+      const hw = jm.inRover ? rover.w : jm.w, hh = jm.inRover ? rover.h : jm.h;
+      if (b.x+b.w>hx && b.x<hx+hw && b.y+b.h>hy && b.y<hy+hh) {
+        if (jm.inRover) { damageRover(2); } else { killJetman(); }
+        ebullets.splice(i,1);
+      }
+    }
+  }
+}
+
+function updateBombs() {
+  for (let i = bombs.length-1; i >= 0; i--) {
+    const b = bombs[i];
+    b.vy += 0.12; b.y += b.vy;
+    const ty = terrainAt(b.x);
+    if (b.y >= ty) {
+      explode(b.x, ty, '#ff5500', 14, 3);
+      sndExplode();
+      // Damage base
+      if (b.x > base.x-20 && b.x < base.x+base.w+20) {
+        base.hp = Math.max(0, base.hp-1);
+        score = Math.max(0, score - 30);
+      }
+      // Hit jetman on ground
+      if (jm.alive && jm.invincible===0 && !jm.inRover) {
+        if (Math.abs(b.x - (jm.x+jm.w/2)) < 30) killJetman();
+      }
+      bombs.splice(i,1); continue;
+    }
+    // Hit jetman mid-air
+    if (jm.alive && jm.invincible===0 && !jm.inRover) {
+      if (Math.abs(b.x-(jm.x+jm.w/2))<18 && Math.abs(b.y-(jm.y+jm.h/2))<18) {
+        explode(b.x, b.y, '#ff5500', 10, 3); sndExplode();
+        bombs.splice(i,1); killJetman(); continue;
+      }
+    }
+    if (b.y > H+60) bombs.splice(i,1);
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length-1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.05; p.vx *= 0.97;
+    p.life--;
+    if (p.life <= 0) particles.splice(i,1);
+  }
+}
+
+function damageRover(dmg) {
+  rover.hp -= dmg;
+  shake = Math.max(shake, 6);
+  if (rover.hp <= 0) {
+    rover.alive = false;
+    explode(rover.x+rover.w/2, rover.y+rover.h/2, '#ff7700', 40, 6);
+    sndExplode();
+    if (jm.inRover) { exitRover(); killJetman(); }
+  }
+}
+
+function killJetman() {
+  if (!jm.alive || jm.invincible > 0) return;
+  explode(jm.x+jm.w/2, jm.y+jm.h/2, '#00ff88', 26, 4);
+  sndDie(); sndExplode();
+  jm.alive = false;
+  lives--;
+  if (lives <= 0) { state='gameover'; return; }
+  deathTimer = 120;
+  state = 'dead';
+}
+
+function respawn() {
+  jm.x = Math.max(100, Math.min(WORLD_W-200, camX + W/2 - 50));
+  jm.y = 0;
+  jm.vx = 0; jm.vy = 0;
+  jm.fuel = jm.maxFuel;
+  jm.invincible = 200;
+  jm.alive = true;
+  jm.inRover = false;
+  rover.hasJetman = false;
+  state = 'playing';
+}
+
+function updateCamera() {
+  const tx = jm.inRover ? rover.x + rover.w/2 - W/2 : jm.x + jm.w/2 - W/2;
+  camX += (tx - camX) * 0.07;
+  camX  = Math.max(0, Math.min(WORLD_W - W, camX));
+}
+
+function checkWave() {
+  if (enemies.length === 0 && pendingSpawns === 0 && waveTimer <= 0 && state==='playing') {
+    waveTimer = 180;
+  }
+  if (waveTimer > 0) {
+    waveTimer--;
+    if (waveTimer === 60) { level++; sndLevelUp(); spawnWave(); }
+  }
+}
+
+// --- DRAW: SPRITES ---
+function drawJetman(x, y, facing, jetting, inv) {
+  if (inv > 0 && Math.floor(inv/5)%2===0) return;
+  ctx.save();
+  ctx.translate(Math.floor(x+7), Math.floor(y+11));
+  if (facing < 0) ctx.scale(-1,1);
+
+  const p = (px,py,w,h,c) => { ctx.fillStyle=c; ctx.fillRect(px-7,py-11,w,h); };
+
+  // Jetpack body
+  p(-4, 3, 5, 14, '#3a4a5a');
+  p(-3, 4, 3, 12, '#5a6a7a');
+  p( 2, 6, 2,  8, '#4a5a6a');
+  // Jetpack nozzles
+  p(-3,15, 2, 4, '#667788');
+  p(-1,15, 2, 4, '#778899');
+
+  // Suit torso
+  p(-1, 3, 9, 10, '#1a6644');
+  p( 0, 4, 7,  8, '#22884d');
+  // Suit chest stripe
+  p( 1, 5, 5,  2, '#00ff88');
+  p( 1, 8, 5,  2, '#00dd66');
+
+  // Helmet
+  p( 0,-3, 9, 8, '#2a3a48');
+  p( 1,-2, 7, 6, '#1a2830');
+  // Visor
+  p( 2,-2, 5, 5, '#0080cc');
+  p( 2,-2, 5, 5, 'rgba(0,200,255,0.5)');
+  // Visor glow
+  ctx.globalAlpha = 0.25;
+  ctx.fillStyle = '#00aaff';
+  ctx.fillRect(-6,-8, 18,12);
+  ctx.globalAlpha = 1;
+  // Helmet light
+  p( 3,-3, 2, 2, '#ffff44');
+
+  // Arms
+  p(-3, 4, 2, 7, '#1a6644');
+  p( 8, 4, 2, 7, '#1a6644');
+  p( 8, 8, 4, 3, '#8899aa'); // gun hand
+
+  // Legs
+  p( 0,13, 4, 6, '#124433');
+  p( 4,13, 4, 6, '#124433');
+  p(-1,18, 4, 3, '#0d3322'); // boot L
+  p( 4,18, 4, 3, '#0d3322'); // boot R
+  // Boot grip
+  p(-1,20, 4, 1, '#446655');
+  p( 4,20, 4, 1, '#446655');
+
+  // Jetpack flame
+  if (jetting) {
+    ctx.globalAlpha = 0.85 + Math.random()*0.15;
+    const fh = 7 + Math.random()*8;
+    p(-3, 17, 2, fh|0, '#ff4400');
+    p(-2, 17, 2, (fh+3)|0, '#ff8800');
+    p(-1, 17, 2, (fh+5)|0, '#ffdd00');
+    p( 0, 17, 2, (fh+3)|0, '#ff8800');
+    p( 1, 17, 2, fh|0, '#ff4400');
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function drawRover(x, y, facing) {
+  if (!rover.alive) return;
+  ctx.save();
+  ctx.translate(Math.floor(x + rover.w/2), Math.floor(y + rover.h/2));
+  if (facing < 0) ctx.scale(-1,1);
+  const p = (px,py,w,h,c) => { ctx.fillStyle=c; ctx.fillRect(px-rover.w/2,py-rover.h/2,w,h); };
+
+  // Main chassis
+  p( 3, 5, 46, 14, '#5a3a18');
+  p( 5, 3, 42, 16, '#7a5228');
+  p( 7, 2, 38, 16, '#8a6238');
+  // Hull highlight
+  p( 8, 3, 10, 3, '#aa7a48');
+  p(32, 3, 10, 3, '#aa7a48');
+  // Undercarriage
+  p( 6,16, 40,  5, '#4a2a08');
+
+  // Gun turret base
+  p(18,-6, 16,  8, '#445566');
+  p(20,-8, 12,  6, '#556677');
+  // Gun barrel
+  p(30,-8, 18,  3, '#99aabb');
+  p(30,-9, 16,  2, '#aabbcc');
+
+  // Energy cell
+  p(10, 6, 8, 8, '#001133');
+  ctx.fillStyle = `hsl(${160+frame*3},100%,50%)`;
+  ctx.fillRect(11-rover.w/2, 7-rover.h/2, 6, 6);
+
+  // Wheels (large with details)
+  const wheel = (wx, wy) => {
+    ctx.fillStyle = '#181818';
+    ctx.beginPath(); ctx.arc(wx,wy, 14, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#333333';
+    ctx.beginPath(); ctx.arc(wx,wy, 10, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#222222';
+    ctx.beginPath(); ctx.arc(wx,wy,  5, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#5a6a7a';
+    ctx.beginPath(); ctx.arc(wx,wy,  2.5, 0, Math.PI*2); ctx.fill();
+    // Tread
+    for (let t=0; t<8; t++) {
+      const a = (t/8)*Math.PI*2 + frame*0.08*facing;
+      ctx.fillStyle = '#2a2a2a';
+      ctx.fillRect(wx+Math.cos(a)*7-1, wy+Math.sin(a)*7-1, 2, 2);
+    }
+  };
+  wheel(-14, 11); wheel(40, 11);
+
+  // Antenna
+  p( 6,-14, 2, 14, '#8899aa');
+  ctx.fillStyle = '#ff1100';
+  ctx.beginPath(); ctx.arc(7-rover.w/2, -14-rover.h/2, 3.5, 0, Math.PI*2); ctx.fill();
+  if (Math.floor(frame/18)%2===0) {
+    ctx.globalAlpha=0.4;
+    ctx.fillStyle='#ff3300';
+    ctx.beginPath(); ctx.arc(7-rover.w/2,-14-rover.h/2,8,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+
+  // Headlight beam
+  ctx.globalAlpha = 0.15 + Math.sin(frame*0.05)*0.05;
+  ctx.fillStyle='#ffff88';
+  ctx.beginPath();
+  ctx.moveTo(44-rover.w/2, 5-rover.h/2);
+  ctx.lineTo(44+36-rover.w/2, -4-rover.h/2);
+  ctx.lineTo(44+36-rover.w/2, 16-rover.h/2);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha=1;
+  // Headlight
+  p(44,  5, 5, 10, '#ffff88');
+
+  // Exhaust puffs
+  if (Math.abs(rover.vx) > 0.2) {
+    ctx.globalAlpha = 0.4 + Math.random()*0.3;
+    p(-4,12, 5, 4, '#888888');
+    p(-9,11, 5, 5, '#666666');
+    ctx.globalAlpha=1;
+  }
+
+  // HP bar
+  if (rover.hp < rover.maxHp) {
+    ctx.fillStyle='#000'; ctx.fillRect(-rover.w/2,-rover.h/2-10,rover.w,5);
+    ctx.fillStyle='#00cc44';
+    ctx.fillRect(-rover.w/2,-rover.h/2-10, rover.w*(rover.hp/rover.maxHp), 5);
+  }
+
+  ctx.restore();
+}
+
+function drawEnemy(e) {
+  const sx = e.x - camX;
+  if (sx < -80 || sx > W+80) return;
+  const d = EDEFS[e.type];
+  const bob = Math.sin(frame*0.05 + e.timer*0.01)*2.5;
+
+  ctx.save();
+  ctx.translate(Math.floor(sx + e.w/2), Math.floor(e.y + e.h/2 + bob));
+
+  // Glow aura
+  ctx.globalAlpha = 0.22 + Math.sin(frame*0.07)*0.05;
+  const grd = ctx.createRadialGradient(0,0,0,0,0,e.w*0.9);
+  grd.addColorStop(0, d.col); grd.addColorStop(1,'transparent');
+  ctx.fillStyle=grd;
+  ctx.fillRect(-e.w,-e.h,-e.w+e.w*2, -e.h+e.h*2); // rough rect
+  ctx.globalAlpha=1;
+
+  if (e.type===0 || e.type===1) {
+    const sc = e.type===1 ? 1.3 : 1;
+    ctx.scale(sc,sc);
+    // Saucer body
+    ctx.fillStyle=d.col;
+    ctx.beginPath(); ctx.ellipse(0, 3, e.w/2, e.h/2, 0, 0, Math.PI*2); ctx.fill();
+    // Rim highlight
+    ctx.fillStyle=d.col2;
+    ctx.beginPath(); ctx.ellipse(0, 2, e.w/2-2, e.h/2-2, 0, 0, Math.PI); ctx.fill();
+    // Dome
+    ctx.fillStyle='#1a2a3a';
+    ctx.beginPath(); ctx.ellipse(0,-1,10,7,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(100,200,255,0.65)';
+    ctx.beginPath(); ctx.ellipse(0,-2,8,5,0,0,Math.PI*2); ctx.fill();
+    // Spinning lights
+    const lc=['#ff0000','#ffff00','#00ff44','#00ccff'];
+    for (let l=0;l<4;l++) {
+      const a=(l/4)*Math.PI*2+frame*0.07;
+      ctx.fillStyle=lc[(l+Math.floor(frame/6))%4];
+      ctx.beginPath(); ctx.arc(Math.cos(a)*(e.w/2-4), 4+Math.sin(a)*2, 2.5, 0, Math.PI*2); ctx.fill();
+    }
+
+  } else if (e.type===2) {
+    // Fighter - angular predator
+    ctx.fillStyle=d.col;
+    ctx.beginPath();
+    ctx.moveTo(0,-e.h/2);
+    ctx.lineTo(e.w/2, e.h/2);
+    ctx.lineTo(e.w/4, e.h/4);
+    ctx.lineTo(-e.w/4, e.h/4);
+    ctx.lineTo(-e.w/2, e.h/2);
+    ctx.closePath(); ctx.fill();
+    // Wings
+    ctx.fillStyle='#880099';
+    ctx.fillRect(-e.w/2, -3, e.w, 5);
+    // Core pulse
+    ctx.fillStyle = `hsl(${280+Math.sin(frame*0.1)*20},100%,70%)`;
+    ctx.beginPath(); ctx.arc(0,0,5+Math.sin(frame*0.15)*2,0,Math.PI*2); ctx.fill();
+    // Engine glow
+    ctx.globalAlpha=0.6+Math.sin(frame*0.2)*0.2;
+    ctx.fillStyle=d.col2;
+    ctx.beginPath(); ctx.arc(0,e.h/2+5,5+Math.random()*3,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+
+  } else if (e.type===3) {
+    // Mothership
+    ctx.fillStyle=d.col;
+    ctx.beginPath(); ctx.ellipse(0,5,e.w/2,e.h/2,0,0,Math.PI*2); ctx.fill();
+    // Structure rings
+    ctx.strokeStyle='#0044aa'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.ellipse(0,5,e.w/2-6,e.h/2-4,0,0,Math.PI*2); ctx.stroke();
+    ctx.strokeStyle='#005acc'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.ellipse(0,5,e.w/2-12,e.h/2-8,0,0,Math.PI*2); ctx.stroke();
+    ctx.lineWidth=1;
+    // Dome
+    ctx.fillStyle='#00112a';
+    ctx.beginPath(); ctx.ellipse(0,-3,20,14,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(0,180,255,0.45)';
+    ctx.beginPath(); ctx.ellipse(0,-4,16,10,0,0,Math.PI*2); ctx.fill();
+    // Orbital lights
+    for (let l=0;l<10;l++) {
+      const a=(l/10)*Math.PI*2 + frame*0.025;
+      const lx=Math.cos(a)*(e.w/2-5), ly=Math.sin(a)*(e.h/2-4)+4;
+      ctx.fillStyle=`hsl(${(l*36+frame*2)%360},100%,65%)`;
+      ctx.beginPath(); ctx.arc(lx,ly,2.8,0,Math.PI*2); ctx.fill();
+    }
+    // Tractor beam flicker
+    if (Math.floor(frame/10)%3===0) {
+      ctx.globalAlpha=0.15;
+      ctx.fillStyle='#00aaff';
+      ctx.beginPath();
+      ctx.moveTo(-10, e.h/2);
+      ctx.lineTo(10, e.h/2);
+      ctx.lineTo(18, 40);
+      ctx.lineTo(-18, 40);
+      ctx.closePath(); ctx.fill();
+      ctx.globalAlpha=1;
+    }
+  }
+
+  // HP bar
+  if (e.hp < e.maxHp) {
+    ctx.fillStyle='#000'; ctx.fillRect(-e.w/2,-e.h/2-9,e.w,5);
+    ctx.fillStyle = e.hp/e.maxHp>0.5?'#00ff44':e.hp/e.maxHp>0.25?'#ffaa00':'#ff2222';
+    ctx.fillRect(-e.w/2,-e.h/2-9, e.w*(e.hp/e.maxHp), 5);
+  }
+
+  ctx.restore();
+}
+
+function drawBase() {
+  const bx = base.x - camX;
+  const by = base.y;
+  const hp = base.hp / base.maxHp;
+
+  // Shield dome
+  if (base.hp > 0) {
+    ctx.globalAlpha = 0.06 + Math.sin(frame*0.04)*0.02;
+    const sdg = ctx.createRadialGradient(bx+base.w/2, by+base.h/2, 0, bx+base.w/2, by+base.h/2, 90);
+    sdg.addColorStop(0, '#00aaff'); sdg.addColorStop(1,'transparent');
+    ctx.fillStyle=sdg; ctx.fillRect(bx-30, by-60, base.w+60, base.h+80);
+    ctx.globalAlpha=0.18;
+    ctx.strokeStyle='#00ccff'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.ellipse(bx+base.w/2, by+base.h, base.w/2+18, 54, 0, Math.PI, 0); ctx.stroke();
+    ctx.globalAlpha=1; ctx.lineWidth=1;
+  }
+
+  // Structure
+  ctx.fillStyle='#2a3a4a'; ctx.fillRect(bx, by, base.w, base.h);
+  ctx.fillStyle='#3a4a5a'; ctx.fillRect(bx+2, by+2, base.w-4, base.h-4);
+
+  // Panel grid
+  for (let r=0;r<3;r++) for (let c=0;c<4;c++) {
+    const px=bx+4+c*30, py=by+4+r*19;
+    const col = hp>0.6?'#00dd66':hp>0.3?'#ffaa00':'#ff2200';
+    ctx.fillStyle=col; ctx.fillRect(px,py,26,15);
+    ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(px,py,26,3); // shadow top
+    // Damage
+    if (Math.random()<(1-hp)*0.25) {
+      ctx.fillStyle='#000';
+      ctx.fillRect(px+Math.random()*18|0, py+Math.random()*10|0, (2+Math.random()*10)|0, 1);
+    }
+    // Panel glow
+    ctx.globalAlpha=0.2;
+    ctx.fillStyle=col;
+    ctx.fillRect(px-2, py-2, 30, 19);
+    ctx.globalAlpha=1;
+  }
+
+  // Dish
+  ctx.fillStyle='#55667a'; ctx.fillRect(bx+base.w/2-2, by-22, 3, 22);
+  ctx.fillStyle='#778899';
+  ctx.beginPath(); ctx.ellipse(bx+base.w/2, by-22, 18, 5, -0.25, 0, Math.PI*2); ctx.fill();
+
+  // Beacon
+  if (Math.floor(frame/14)%2===0) {
+    ctx.fillStyle='#ff0000';
+    ctx.beginPath(); ctx.arc(bx+base.w/2, by-22, 3.5, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha=0.35; ctx.fillStyle='#ff0000';
+    ctx.beginPath(); ctx.arc(bx+base.w/2, by-22, 8, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+
+  // HP label
+  ctx.fillStyle = hp>0.6?'#00ff88':hp>0.3?'#ffaa00':'#ff4444';
+  ctx.font = '9px "Courier New"'; ctx.textAlign='center';
+  ctx.fillText('BASE HP: '+base.hp+'/'+base.maxHp, bx+base.w/2, by-30);
+  ctx.textAlign='left';
+}
+
+function drawTerrain() {
+  // Sky
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,'#000008'); sky.addColorStop(0.7,'#040018'); sky.addColorStop(1,'#080025');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+
+  // Nebulae
+  [[W*0.25,H*0.18,260,'#002288'],[W*0.75,H*0.28,200,'#880033'],[W*0.5,H*0.1,180,'#003355']].forEach(([nx,ny,nr,nc])=>{
+    ctx.globalAlpha=0.045;
+    const ng=ctx.createRadialGradient(nx,ny,0,nx,ny,nr);
+    ng.addColorStop(0,nc); ng.addColorStop(1,'transparent');
+    ctx.fillStyle=ng; ctx.fillRect(0,0,W,H);
+  });
+  ctx.globalAlpha=1;
+
+  // Stars (parallax)
+  for (const s of stars) {
+    let sx = (s.x - camX * s.speed) % WORLD_W;
+    sx = ((sx % W) + W) % W;
+    ctx.globalAlpha = s.b * (0.6 + Math.sin(frame*0.015+s.twinkle)*0.4);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(sx, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha=1;
+
+  // Terrain fill
+  ctx.beginPath();
+  ctx.moveTo(0, H);
+  const step = 2;
+  for (let x=0; x<=W; x+=step) {
+    ctx.lineTo(x, terrainAt(camX+x));
+  }
+  ctx.lineTo(W, H); ctx.closePath();
+  const tg = ctx.createLinearGradient(0, H-130, 0, H);
+  tg.addColorStop(0,'#243040'); tg.addColorStop(0.4,'#172030'); tg.addColorStop(1,'#0a1020');
+  ctx.fillStyle=tg; ctx.fill();
+
+  // Surface glow line
+  ctx.beginPath();
+  for (let x=0; x<=W; x+=step) {
+    const ty=terrainAt(camX+x);
+    x===0 ? ctx.moveTo(x,ty) : ctx.lineTo(x,ty);
+  }
+  ctx.strokeStyle='rgba(80,150,200,0.5)'; ctx.lineWidth=2.5; ctx.stroke();
+  ctx.strokeStyle='rgba(120,200,255,0.15)'; ctx.lineWidth=5; ctx.stroke();
+  ctx.lineWidth=1;
+
+  // Surface detail dots (rocks)
+  ctx.fillStyle='rgba(80,100,130,0.7)';
+  for (let x=Math.floor(camX/50)*50; x<camX+W+50; x+=50+((x*17)%30)) {
+    const ty=terrainAt(x)-1;
+    const r=1+(x*7)%4;
+    ctx.fillRect(x-camX-r/2, ty-r, r, r);
+  }
+}
+
+function drawBullets() {
+  for (const b of bullets) {
+    const sx=b.x-camX;
+    // Glow
+    ctx.globalAlpha=0.35;
+    ctx.fillStyle = b.owner==='rover' ? '#ffdd00' : '#00ffcc';
+    ctx.fillRect(sx-5, b.y-5, b.w+10, b.h+10);
+    ctx.globalAlpha=1;
+    ctx.fillStyle = b.owner==='rover' ? '#fff066' : '#00ffee';
+    ctx.fillRect(sx, b.y, b.w, b.h);
+    // Tail
+    ctx.globalAlpha=0.3;
+    ctx.fillStyle = b.owner==='rover' ? '#ffaa00' : '#00aa88';
+    ctx.fillRect(sx - b.vx*2, b.y, b.w*0.6, b.h);
+    ctx.globalAlpha=1;
+  }
+
+  for (const b of ebullets) {
+    const sx=b.x-camX;
+    ctx.globalAlpha=0.3; ctx.fillStyle='#ff2222';
+    ctx.fillRect(sx-4,b.y-4,b.w+8,b.h+8);
+    ctx.globalAlpha=1; ctx.fillStyle='#ff5555';
+    ctx.fillRect(sx,b.y,b.w,b.h);
+  }
+
+  for (const b of bombs) {
+    const sx=b.x-camX;
+    ctx.fillStyle='#ff5500';
+    ctx.beginPath(); ctx.arc(sx,b.y,4.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ffaa00';
+    ctx.beginPath(); ctx.arc(sx-0.5,b.y-0.5,2.5,0,Math.PI*2); ctx.fill();
+    // Smoke
+    ctx.globalAlpha=0.2+Math.random()*0.1;
+    ctx.fillStyle='#aaaaaa';
+    ctx.fillRect(sx-1, b.y-12, 3, 8);
+    ctx.globalAlpha=1;
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const a = p.life/p.maxLife;
+    ctx.globalAlpha = a*a;
+    ctx.fillStyle = p.col;
+    const sx = p.x - camX;
+    ctx.fillRect(sx-p.size/2, p.y-p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawHUD() {
+  // Top bar background
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillRect(0,0,W,54);
+  ctx.fillStyle='rgba(0,255,136,0.12)';
+  ctx.fillRect(0,52,W,2);
+
+  // Lives
+  ctx.fillStyle='#00ffaa'; ctx.font='bold 13px "Courier New"';
+  ctx.fillText('JETS', 10, 22);
+  for (let i=0; i<lives; i++) {
+    ctx.fillStyle='#00ff88';
+    ctx.fillRect(50+i*18, 10, 5, 9);    // body
+    ctx.fillRect(49+i*18, 6, 7, 6);     // helmet
+    ctx.fillRect(46+i*18, 10, 3, 7);    // pack
+    ctx.fillStyle='#0088ff';
+    ctx.fillRect(50+i*18, 7, 5, 4);     // visor
+  }
+
+  // Score
+  ctx.fillStyle='#ffffff'; ctx.font='bold 20px "Courier New"';
+  ctx.textAlign='center';
+  ctx.fillText(String(score).padStart(9,'0'), W/2, 22);
+  ctx.textAlign='left';
+
+  // Level
+  ctx.fillStyle='#8888ff'; ctx.font='bold 13px "Courier New"';
+  ctx.textAlign='right';
+  ctx.fillText(`SECTOR ${level}`, W-10, 22);
+  ctx.textAlign='left';
+
+  // Fuel bar
+  const fw=110, fx=W-fw-12, fy=28;
+  ctx.fillStyle='#001100'; ctx.fillRect(fx,fy,fw,8);
+  const fp = jm.fuel/jm.maxFuel;
+  const fc = fp>0.5?'#00ee44':fp>0.25?'#ffaa00':'#ff2200';
+  ctx.fillStyle=fc; ctx.fillRect(fx,fy,fw*fp,8);
+  ctx.strokeStyle='rgba(0,200,100,0.3)'; ctx.strokeRect(fx,fy,fw,8);
+  ctx.fillStyle='#44aa66'; ctx.font='9px "Courier New"'; ctx.textAlign='right';
+  ctx.fillText('FUEL', fx-3, fy+8);
+  ctx.textAlign='left';
+
+  // Base HP bar
+  const bw=110, bx2=W-bw-12, by2=40;
+  ctx.fillStyle='#110000'; ctx.fillRect(bx2,by2,bw,8);
+  const bhp=base.hp/base.maxHp;
+  ctx.fillStyle=bhp>0.5?'#0099ff':bhp>0.25?'#ffaa00':'#ff2200';
+  ctx.fillRect(bx2,by2,bw*bhp,8);
+  ctx.strokeStyle='rgba(0,100,200,0.3)'; ctx.strokeRect(bx2,by2,bw,8);
+  ctx.fillStyle='#5588aa'; ctx.font='9px "Courier New"'; ctx.textAlign='right';
+  ctx.fillText('BASE', bx2-3, by2+8);
+  ctx.textAlign='left';
+
+  // Enemy count / wave status
+  ctx.textAlign='center';
+  if (enemies.length > 0) {
+    ctx.fillStyle='#ff4444'; ctx.font='11px "Courier New"';
+    ctx.fillText(`${enemies.length} HOSTILE${enemies.length>1?'S':''} IN SECTOR`, W/2, 42);
+  } else if (waveTimer > 0) {
+    ctx.fillStyle='#00ff88'; ctx.font='11px "Courier New"';
+    const secs = Math.ceil(waveTimer/60);
+    ctx.fillText(`SECTOR CLEAR. NEXT WAVE IN ${secs}s`, W/2, 42);
+  }
+  ctx.textAlign='left';
+
+  // Controls bar
+  ctx.fillStyle='rgba(0,0,0,0.4)'; ctx.fillRect(0,H-22,W,22);
+  ctx.fillStyle='rgba(0,255,136,0.12)'; ctx.fillRect(0,H-23,W,1);
+  ctx.fillStyle='rgba(100,160,140,0.7)'; ctx.font='10px "Courier New"';
+  ctx.fillText('WASD/ARROWS:Move  SPACE/W:Jetpack  Z/X:Fire  E/ENTER:Board Rover  P:Pause', 8, H-7);
+
+  // Proximity arrow to base
+  const baseSX = base.x + base.w/2 - camX;
+  if (baseSX < 20 || baseSX > W-20) {
+    ctx.fillStyle='#00aaff'; ctx.font='bold 14px "Courier New"';
+    ctx.textAlign = baseSX < 20 ? 'left' : 'right';
+    ctx.fillText(baseSX < 20 ? '< BASE' : 'BASE >', baseSX < 20 ? 5 : W-5, H/2);
+    ctx.textAlign='left';
+  }
+
+  // Proximity arrow to rover
+  if (!jm.inRover && rover.alive) {
+    const rSX = rover.x + rover.w/2 - camX;
+    if (rSX < 20 || rSX > W-20) {
+      ctx.fillStyle='#ffaa00'; ctx.font='bold 13px "Courier New"';
+      ctx.textAlign = rSX < 20 ? 'left' : 'right';
+      ctx.fillText(rSX < 20 ? '< ROVER' : 'ROVER >', rSX < 20 ? 5 : W-5, H/2+22);
+      ctx.textAlign='left';
+    }
+  }
+
+  // Scanlines
+  ctx.fillStyle='rgba(0,0,0,0.025)';
+  for (let y=0; y<H; y+=3) ctx.fillRect(0,y,W,1);
+
+  // Invincible flash
+  if (jm.invincible>0 && Math.floor(jm.invincible/8)%2===0) {
+    ctx.fillStyle='rgba(0,255,136,0.06)';
+    ctx.fillRect(0,0,W,H);
+  }
+}
+
+function drawOverlay(title, sub1, sub2, col) {
+  ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(0,0,W,H);
+  // CRT border glow
+  ctx.strokeStyle=col; ctx.lineWidth=2;
+  ctx.strokeRect(30,H/2-80,W-60,160);
+  ctx.globalAlpha=0.1; ctx.fillStyle=col;
+  ctx.fillRect(30,H/2-80,W-60,160);
+  ctx.globalAlpha=1; ctx.lineWidth=1;
+
+  ctx.fillStyle=col; ctx.font=`bold 44px "Courier New"`; ctx.textAlign='center';
+  ctx.fillText(title, W/2, H/2-20);
+  ctx.fillStyle='#cccccc'; ctx.font='18px "Courier New"';
+  ctx.fillText(sub1, W/2, H/2+18);
+  ctx.fillStyle = Math.floor(frame/20)%2===0 ? '#ffffff' : '#888888';
+  ctx.font='14px "Courier New"';
+  ctx.fillText(sub2, W/2, H/2+48);
+  ctx.textAlign='left';
+}
+
+function drawTitle() {
+  // Background sky + stars
+  const sky=ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,'#000008'); sky.addColorStop(1,'#040020');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+
+  for (const s of stars) {
+    const sx=((s.x+frame*s.speed*0.2)%W+W)%W;
+    ctx.globalAlpha=s.b*(0.5+Math.sin(frame*0.02+s.twinkle)*0.5);
+    ctx.fillStyle='#fff'; ctx.fillRect(sx,s.y,s.r,s.r);
+  }
+  ctx.globalAlpha=1;
+
+  // Terrain silhouette
+  ctx.beginPath(); ctx.moveTo(0,H);
+  for (let x=0;x<=W;x+=3) ctx.lineTo(x, terrainAt(x*2)*0.6+H*0.55);
+  ctx.lineTo(W,H); ctx.closePath();
+  ctx.fillStyle='#0d1828'; ctx.fill();
+
+  // Title glow
+  ctx.globalAlpha=0.15+Math.sin(frame*0.05)*0.05;
+  const tg=ctx.createRadialGradient(W/2,H/2-50,0,W/2,H/2-50,280);
+  tg.addColorStop(0,'#00ff88'); tg.addColorStop(1,'transparent');
+  ctx.fillStyle=tg; ctx.fillRect(0,0,W,H);
+  ctx.globalAlpha=1;
+
+  // Title text
+  ctx.textAlign='center';
+  // Shadow
+  ctx.fillStyle='#003322';
+  ctx.font='bold 52px "Courier New"';
+  ctx.fillText('LUNAR JETMAN', W/2+3, H/2-43);
+  // Main
+  const lg=ctx.createLinearGradient(W/2-200,0,W/2+200,0);
+  lg.addColorStop(0,'#00aa55'); lg.addColorStop(0.5,'#00ffaa'); lg.addColorStop(1,'#00aa55');
+  ctx.fillStyle=lg; ctx.fillText('LUNAR JETMAN', W/2, H/2-45);
+  // 64 badge
+  ctx.fillStyle='#8888ff'; ctx.font='bold 26px "Courier New"';
+  ctx.fillText('64', W/2+173, H/2-68);
+
+  ctx.fillStyle='rgba(0,255,136,0.6)'; ctx.font='13px "Courier New"';
+  ctx.fillText('A MODERNIZED REIMAGINING OF THE CLASSIC ZX SPECTRUM GAME', W/2, H/2);
+
+  ctx.fillStyle=Math.floor(frame/18)%2===0?'#ffffff':'#666666';
+  ctx.font='17px "Courier New"';
+  ctx.fillText('PRESS SPACE OR ENTER TO LAUNCH', W/2, H/2+42);
+
+  ctx.fillStyle='rgba(100,150,200,0.6)'; ctx.font='11px "Courier New"';
+  ctx.fillText('WASD/ARROWS: Move  |  SPACE: Jetpack  |  Z/X: Fire  |  E: Board/Exit Rover', W/2, H/2+80);
+
+  // Mini jetman animation
+  const mjx = W/2 + Math.sin(frame*0.04)*60, mjy=H/2-110+Math.sin(frame*0.07)*15;
+  ctx.save(); ctx.translate(mjx, mjy);
+  ctx.fillStyle='#22884d'; ctx.fillRect(-5,-10,12,12);
+  ctx.fillStyle='#1a2830'; ctx.fillRect(-4,-18,10,9);
+  ctx.fillStyle='rgba(0,200,255,0.8)'; ctx.fillRect(-2,-16,6,6);
+  ctx.fillStyle='#ff6600';
+  ctx.fillRect(-4,2,3,(8+Math.random()*5)|0);
+  ctx.fillRect(-2,2,3,(10+Math.random()*5)|0);
+  ctx.fillRect(0,2,3,(8+Math.random()*5)|0);
+  ctx.restore();
+
+  ctx.textAlign='left';
+}
+
+function drawPaused() {
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ffff44'; ctx.font='bold 36px "Courier New"'; ctx.textAlign='center';
+  ctx.fillText('PAUSED', W/2, H/2);
+  ctx.fillStyle='#888888'; ctx.font='14px "Courier New"';
+  ctx.fillText('Press P to resume', W/2, H/2+36);
+  ctx.textAlign='left';
+}
+
+// --- MAIN LOOP ---
+// Fixed 60 Hz simulation, decoupled from the display refresh rate.
+const STEP_MS = 1000 / 60;
+let lastTs = 0, acc = 0;
+
+function tick() {
+  frame++;
+  if (state === 'title') return;
+
+  if (state === 'playing') {
+    updateJetman();
+    updateRover();
+    updateEnemies();
+    updateBullets();
+    updateBombs();
+    updateParticles();
+    updateCamera();
+    checkWave();
+    if (base.hp <= 0 && state === 'playing') {
+      explode(base.x + base.w/2, base.y + base.h/2, '#ff4400', 50, 7);
+      sndExplode();
+      state = 'gameover';
+    }
+    if (shake > 0) shake = Math.max(0, shake - 0.9);
+  }
+
+  if (state === 'dead') {
+    deathTimer--;
+    updateParticles();
+    updateCamera();
+    if (deathTimer <= 0) respawn();
+  }
+}
+
+function render() {
+  if (state === 'title') { drawTitle(); return; }
+
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+
+  drawTerrain();
+  drawBase();
+  drawParticles();
+  drawBullets();
+  if (rover.alive) drawRover(rover.x - camX, rover.y, rover.facing);
+  if (jm.alive && !jm.inRover) drawJetman(jm.x - camX, jm.y, jm.facing, jm.jetting, jm.invincible);
+  for (const e of enemies) drawEnemy(e);
+
+  ctx.restore();
+  drawHUD();
+
+  if (state === 'dead') {
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ff4444'; ctx.font = 'bold 28px "Courier New"'; ctx.textAlign = 'center';
+    ctx.fillText('JETMAN DOWN', W/2, H/2);
+    ctx.fillStyle = '#ffaa44'; ctx.font = '16px "Courier New"';
+    ctx.fillText(`${lives} REMAINING`, W/2, H/2 + 32);
+    ctx.textAlign = 'left';
+  }
+  if (state === 'gameover') drawOverlay('GAME OVER', 'FINAL SCORE: ' + score, 'PRESS R OR ENTER TO RETRY', '#ff3333');
+  if (state === 'paused')   drawPaused();
+}
+
+function loop(ts) {
+  if (typeof ts !== 'number') ts = lastTs + STEP_MS;
+  if (!lastTs) lastTs = ts;
+  acc += Math.min(100, ts - lastTs);   // clamp so a background tab doesn't cause a huge catch-up
+  lastTs = ts;
+  let steps = 0;
+  while (acc >= STEP_MS && steps < 5) { tick(); acc -= STEP_MS; steps++; }
+  if (steps === 5) acc = 0;
+  render();
+  requestAnimationFrame(loop);
+}
+
+// --- BOOT ---
+buildTerrain();
+buildStars();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
